@@ -259,7 +259,7 @@ void lineFollowT(int power, int time, int behavior){
             printf("correct left\n");
         }
         //Forward
-        else{
+        else{y
             moveT(power, power, 100);
             printf("forward\n");
         }
@@ -282,7 +282,7 @@ void reset(){
     You may want to put servos back to default positions here
     */
     initDriveConstants();
-    calibrateGyro(200);
+    calibrateGyro(250);
     resetAngle();
     disable_servos();
     resetMotors();
@@ -295,7 +295,7 @@ void reset(){
         printf("Battery approaching low: %.1f%%\n", currentBatteryLife);
     }
     else {
-        printf("Battery is at: %.1f%%\n", currentBatteryLife);
+        printf("Battery is at: %i%%\n", (int)currentBatteryLife);
     }
 }
 
