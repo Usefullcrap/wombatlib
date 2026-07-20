@@ -9,8 +9,8 @@
 #endif
 
 /*
+    Created by Matteo Tang at an unreasonable time in the morning. WIP. 7/19/2026
     THIS TEMPLATE CODE ASSUMES A 2 WHEELED BOT WITH 2 TOPHAT SENSORS ON EACH SIDE OF THE FRONT OF THE BOT
-    Created by Matteo Tang at an unreasonable time in the morning. WIP
     I am more than sure that this bot will be really rigid due to it not being able to drift with gyros. I hope to fix this in the future.
 */
 
