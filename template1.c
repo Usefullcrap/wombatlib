@@ -297,6 +297,7 @@ void reset(){
     else {
         printf("Battery is at: %i%%\n", (int)currentBatteryLife);
     }
+    msleep(3000);
 }
 
 //Wait for light + autoshutoff. true true is competition ready, false true is perfect for time testing, and false false is good for first runs.
