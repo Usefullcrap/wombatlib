@@ -1,4 +1,4 @@
-#include <kipr/wallaby.h>
+#include <kipr/wombat.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -12,15 +12,21 @@
     Created by Matteo Tang at an unreasonable time in the morning. WIP. 7/19/2026
     THIS TEMPLATE CODE ASSUMES A 2 WHEELED BOT WITH 2 TOPHAT SENSORS ON EACH SIDE OF THE FRONT OF THE BOT
     I am more than sure that this bot will be really rigid due to it not being able to drift with gyros. I hope to fix this in the future.
+
+    UPDATED: moveD() and turn() now use independent per-wheel encoder tracking instead of
+    relying on the gyro, since the gyro-based heading correction was causing infinite loops.
+    The gyro functions are left in place (with a fixed scale comment) in case you want to
+    revisit gyro-based correction later, but nothing below currently depends on them.
 */
 
 #define gmpc(port) get_motor_position_counter(port)
 #define cmpc(port) clear_motor_position_counter(port)
 
 /*
-degrees/sec per raw unit, confirm the exact value in the KIPR docs
+GYRO_SCALE: raw gyro units per degree/second
+Confirm the exact value for your gyro in the KIPR docs
 */
-const double GYRO_SCALE = 512.0;//512 for wombat
+const double GYRO_SCALE = 512.0; //512 for wombat
 
 static double angle = 0.0;
 static double gyroBias = 0.0;
@@ -28,11 +34,11 @@ static struct timespec lastTime;
 static int initialized = 0;
 
 //Change as needed, bot may not act as intended if not
-static double wheelRadiusMM = 40;
-static int motor1Ticks = 1200;
-static int motor2Ticks = 1200;
-static int averageTicks = 0;
-static double distanceMM = 0.0;
+static double wheelRadiusMM = 35;
+static int motor1Ticks = 1800; // left wheel ticks per revolution
+static int motor2Ticks = 1800; // right wheel ticks per revolution
+static double distPerTickLeft = 0.0;
+static double distPerTickRight = 0.0;
 static int leftPort = 0;
 static int rightPort = 1;
 static int leftSensor = 0;
@@ -43,14 +49,17 @@ static int lineFollowValue2 = 3875;
 static int lightPort = 3;
 static int lightThreshold = 2500;
 
+//Measure center-to-center distance between the two drive wheels. Needed for turnByEncoder().
+static double trackWidthMM = 165;
+
 
 
 /*
     Computes variables
 */
-void initDriveConstants(){
-    averageTicks = (motor1Ticks + motor2Ticks) / 2;
-    distanceMM = (2.0 * M_PI * wheelRadiusMM) / averageTicks;
+void initDriveConstants() {
+    distPerTickLeft = (2.0 * M_PI * wheelRadiusMM) / motor1Ticks;
+    distPerTickRight = (2.0 * M_PI * wheelRadiusMM) / motor2Ticks;
 }
 
 
@@ -58,13 +67,13 @@ void initDriveConstants(){
 
 
 /*
-    GYRO RELATED
+    GYRO RELATED (currently unused by moveD/turn, kept for future use)
 */
 //Call this once at startup while the robot is completely still.
-void calibrateGyro(int numSamples){
+void calibrateGyro(int numSamples) {
     long sum = 0;
 
-    for (int i = 0; i < numSamples; i++){
+    for (int i = 0; i < numSamples; i++) {
         sum += gyro_z();
         msleep(2);
     }
@@ -73,18 +82,18 @@ void calibrateGyro(int numSamples){
 }
 
 //Resets the accumulated angle back to zero and restarts the timer.
-void resetAngle(){
+void resetAngle() {
     angle = 0.0;
     clock_gettime(CLOCK_MONOTONIC, &lastTime);
     initialized = 1;
 }
 
 //Returns angle in degrees
-double getAngle(){
+double getAngle() {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    if (!initialized){
+    if (!initialized) {
         lastTime = now;
         initialized = 1;
         return angle;
@@ -110,22 +119,25 @@ double getAngle(){
 Power 1 should be left, power 2 should be right. Check variables.
 */
 
-//Cumulative distance (mm) traveled since the last cmpc() reset on both ports.
-double calculateDistance(){
-    int distanceTick = (gmpc(leftPort) + gmpc(rightPort)) / 2;
-    return distanceTick * distanceMM;
+//Cumulative distance (mm) traveled since the last cmpc() reset, per wheel.
+double leftDistanceMM() {
+    return gmpc(leftPort) * distPerTickLeft;
+}
+
+double rightDistanceMM() {
+    return gmpc(rightPort) * distPerTickRight;
 }
 
 //Stops all motors instantly
-void resetMotors(){
-    for (int i = 0; i < 4; i++){
+void resetMotors() {
+    for (int i = 0; i < 4; i++) {
         motor(i, 0);
         msleep(1);
     }
 }
 
-//Time based movement, ms, omnidirectional, allows for manual rotation. Does not account for gyro
-void moveT(int power1, int power2, int time){
+//Time based movement, ms, omnidirectional, allows for manual rotation.
+void moveT(int power1, int power2, int time) {
     motor(leftPort, power1);
     motor(rightPort, power2);
     msleep(time);
@@ -133,66 +145,75 @@ void moveT(int power1, int power2, int time){
 }
 
 //Distance based movement, mm, forward and backward only.
-void moveD(int power, int distance){
-    if (power == 0 || distance <= 0){
+//Corrects straightness by comparing each wheel's own traveled distance rather than a gyro heading.
+void moveD(int power, int distance) {
+    if (power == 0 || distance <= 0) {
         return;
     }
 
     cmpc(leftPort);
     cmpc(rightPort);
 
-    double startAngle = getAngle();
-    double completedDistance = 0;
+    double leftTraveled = 0.0;
+    double rightTraveled = 0.0;
 
-    const int correctionPower = power / 4;   //how hard to nudge back on course
-    const double headingTolerance = 3.0;     //degrees of drift allowed before correcting
+    const double toleranceMM = 2.0;     //how much drift between wheels is okay
+    const double correctionGain = 2.0;  //power reduction per mm of drift
+    const int maxCorrection = power / 2;
 
-    while (completedDistance < distance){
-        double headingError = getAngle() - startAngle;
+    while ((leftTraveled + rightTraveled) / 2.0 < distance) {
+        leftTraveled = leftDistanceMM();
+        rightTraveled = rightDistanceMM();
 
-        if (headingError > headingTolerance){
-            //right
-            motor(leftPort, power);
-            motor(rightPort, power - correctionPower);
+        double diff = leftTraveled - rightTraveled; // + means left is ahead
+        int correction = (int)(fabs(diff) * correctionGain);
+        if (correction > maxCorrection) correction = maxCorrection;
+
+        int leftPower = power;
+        int rightPower = power;
+
+        if (diff > toleranceMM) {
+            leftPower -= correction;   //left is ahead, slow it down
         }
-        else if (headingError < -headingTolerance){
-            //left
-            motor(leftPort, power - correctionPower);
-            motor(rightPort, power);
-        }
-        else{
-            motor(leftPort, power);
-            motor(rightPort, power);
+        else if (diff < -toleranceMM) {
+            rightPower -= correction;  //right is ahead, slow it down
         }
 
+        motor(leftPort, leftPower);
+        motor(rightPort, rightPower);
         msleep(20);
-        completedDistance = calculateDistance();
     }
 
     resetMotors();
-    printf("moved %i", distance);
+    printf("moved %i\n", distance);
 }
 
-//Positive is counter clockwise, negative is clockwise
-void turn(int degrees, int power){
-    if (degrees == 0){ return; }
+//Positive is counter clockwise, negative is clockwise.
+//Uses per-wheel encoder distance and track width to estimate rotation instead of the gyro.
+void turn(int degrees, int power) {
+    if (degrees == 0) { return; }
 
-    double startAngle = getAngle();
+    cmpc(leftPort);
+    cmpc(rightPort);
 
-    if (degrees > 0){
-        while (getAngle() < startAngle + degrees){
-            moveT(power, -power, 10);
-        }
-    }
-    else{
-        //clockwise
-        while (getAngle() > startAngle + degrees){
-            moveT(-power, power, 10);
-        }
+    double targetArcLength = (fabs((double)degrees) * M_PI / 180.0) * (trackWidthMM / 2.0);
+
+    int leftDir = (degrees > 0) ? -1 : 1;
+    int rightDir = (degrees > 0) ? 1 : -1;
+
+    double leftTraveled = 0.0, rightTraveled = 0.0;
+
+    while ((fabs(leftTraveled) + fabs(rightTraveled)) / 2.0 < targetArcLength) {
+        motor(leftPort, leftDir * power);
+        motor(rightPort, rightDir * power);
+        msleep(3);
+
+        leftTraveled = leftDistanceMM();
+        rightTraveled = rightDistanceMM();
     }
 
     resetMotors();
-    printf("Turn completed. New bearing is %f", getAngle());
+    printf("Turn completed.\n");
 }
 
 /*
@@ -204,16 +225,16 @@ behavior at an intersection:
 
 Based upon GCER 2026 line follow code which uses time. I dont think I will add a distance one
 */
-void lineFollowT(int power, int time, int behavior){
+void lineFollowT(int power, int time, int behavior) {
     int tick = 0;
 
-    while (tick < time){
+    while (tick < time) {
         int a0Value = analog(leftSensor);
         int a1Value = analog(rightSensor);
 
         //Stop when either sensor sees black
-        if (behavior == 2){
-            if (a0Value > lineFollowValue1 || a1Value > lineFollowValue2){
+        if (behavior == 2) {
+            if (a0Value > lineFollowValue1 || a1Value > lineFollowValue2) {
                 resetMotors();
                 printf("stopped at intersection\n");
                 return;
@@ -225,8 +246,8 @@ void lineFollowT(int power, int time, int behavior){
         }
 
         //Intersection
-        if (a0Value > lineFollowValue1 && a1Value > lineFollowValue2){
-            switch (behavior){
+        if (a0Value > lineFollowValue1 && a1Value > lineFollowValue2) {
+            switch (behavior) {
             case -1:
                 moveT(0, power, 100);
                 printf("intersection: left\n");
@@ -249,17 +270,17 @@ void lineFollowT(int power, int time, int behavior){
             }
         }
         //Correct right
-        else if (a0Value > lineFollowValue1){
+        else if (a0Value > lineFollowValue1) {
             moveT(0, power, 100);
             printf("correct right\n");
         }
         //Correct left
-        else if (a1Value > lineFollowValue2){
+        else if (a1Value > lineFollowValue2) {
             moveT(power, 0, 100);
             printf("correct left\n");
         }
         //Forward
-        else{y
+        else {
             moveT(power, power, 100);
             printf("forward\n");
         }
@@ -277,7 +298,7 @@ void lineFollowT(int power, int time, int behavior){
 */
 
 //Full bot reset, change based on task
-void reset(){
+void reset() {
     /*
     You may want to put servos back to default positions here
     */
@@ -287,7 +308,7 @@ void reset(){
     disable_servos();
     resetMotors();
     printf("Bot reset.\n");
-    float currentBatteryLife = power_level();
+    float currentBatteryLife = power_level() * 100;
     if (currentBatteryLife < 15) {
         printf("WARNING! Battery low: %.1f%%\n", currentBatteryLife);
     }
@@ -301,20 +322,20 @@ void reset(){
 }
 
 //Wait for light + autoshutoff. true true is competition ready, false true is perfect for time testing, and false false is good for first runs.
-void startSequence(bool waitForLight, bool autoShutOff){
-    while (waitForLight && analog(lightPort) < lightThreshold){
+void startSequence(bool waitForLight, bool autoShutOff) {
+    while (waitForLight && analog(lightPort) < lightThreshold) {
         printf("Current light value: %d\n", analog(lightPort));
         msleep(50);
     }
-    if (autoShutOff){
+    if (autoShutOff) {
         int shutDownDelay = 119;
         shut_down_in(shutDownDelay); //Limit during competition is 120 seconds but 119 is safer.
-        printf("Will shut down in %d seconds", shutDownDelay);
+        printf("Will shut down in %d seconds\n", shutDownDelay);
     }
     printf("Running");
 }
 
-int main(void){
+int main(void) {
     reset();
     startSequence(true, true);
     return 0;
